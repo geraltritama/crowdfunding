@@ -6,16 +6,13 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-crowdfunding = "FSdwWj1XYtrgf5xyNq7exDXzNGBUZ7ZSuG2zwoxRprwR"
+crowdfunding = "F3k9VhRhE9JwkgRNryjkzu7CL3z8epdLc3hHxe2Bg5gu"
 
 [programs.devnet]
-crowdfunding = "FSdwWj1XYtrgf5xyNq7exDXzNGBUZ7ZSuG2zwoxRprwR"
+crowdfunding = "F3k9VhRhE9JwkgRNryjkzu7CL3z8epdLc3hHxe2Bg5gu"
 
 [provider]
-cluster = "devnet"
+cluster = "localnet"
 wallet = "~/.config/solana/id.json"
-
-[scripts]
-test = "anchor test"
 
 [hooks]
