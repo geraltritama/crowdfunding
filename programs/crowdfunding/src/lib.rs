@@ -35,11 +35,8 @@ pub mod crowdfunding {
         // Create the vault PDA as a system-owned account with 0 data.
         // Anchor v1.0.0 can't `init` a `SystemAccount`, so we do it manually.
         let campaign_key = campaign.key();
-        let (vault_pda, vault_bump) = Pubkey::find_program_address(
-            &[b"vault", campaign_key.as_ref()],
-            ctx.program_id,
-        );
-        require_keys_eq!(vault_pda, ctx.accounts.vault.key(), CrowdError::InvalidVault);
+        let vault_pda = ctx.accounts.vault.key();
+        let vault_bump = ctx.bumps.vault;
 
         // Only create if it doesn't exist yet.
         if ctx.accounts.vault.lamports() == 0 {
@@ -110,6 +107,15 @@ pub mod crowdfunding {
             .checked_add(amount)
             .ok_or(CrowdError::MathOverflow)?;
 
+        // Track per-donor contribution
+        let contribution = &mut ctx.accounts.contribution;
+        contribution.campaign = campaign.key();
+        contribution.contributor = contributor.key();
+        contribution.amount = contribution
+            .amount
+            .checked_add(amount)
+            .ok_or(CrowdError::MathOverflow)?;
+
         msg!(
             "Contributed: {} lamports, total={}",
             amount,
@@ -149,9 +155,7 @@ pub mod crowdfunding {
         // Transfer all lamports from vault PDA to creator
         let vault_key = vault.key();
         let campaign_key = campaign.key();
-        let (expected_vault, vault_bump) =
-            Pubkey::find_program_address(&[b"vault", campaign_key.as_ref()], ctx.program_id);
-        require_keys_eq!(expected_vault, vault_key, CrowdError::InvalidVault);
+        let vault_bump = ctx.bumps.vault;
         let seeds: &[&[u8]] = &[b"vault", campaign_key.as_ref(), &[vault_bump]];
 
         // System transfer from vault to creator using invoke_signed
@@ -181,11 +185,8 @@ pub mod crowdfunding {
         let campaign = &mut ctx.accounts.campaign;
         let contributor = &ctx.accounts.contributor;
         let vault = &mut ctx.accounts.vault;
+        let contribution = &mut ctx.accounts.contribution;
         let system_program = &ctx.accounts.system_program;
-
-        if campaign.claimed {
-            return Err(CrowdError::AlreadyClaimed.into());
-        }
 
         if current_time < campaign.deadline {
             return Err(CrowdError::TooEarly.into());
@@ -195,17 +196,22 @@ pub mod crowdfunding {
             return Err(CrowdError::GoalReachedNoRefund.into());
         }
 
-        let amount = vault.lamports();
+        // Refund only what this contributor donated to this campaign.
+        if contribution.campaign != campaign.key() || contribution.contributor != contributor.key() {
+            return Err(CrowdError::InvalidContributionAccount.into());
+        }
+
+        let amount = contribution.amount;
         if amount == 0 {
             return Err(CrowdError::NothingToRefund.into());
         }
 
-        // Transfer all vault lamports back to the caller (refund path).
+        require!(vault.lamports() >= amount, CrowdError::InsufficientVaultBalance);
+
+        // Transfer contributor's lamports back from the vault PDA.
         let vault_key = vault.key();
         let campaign_key = campaign.key();
-        let (expected_vault, vault_bump) =
-            Pubkey::find_program_address(&[b"vault", campaign_key.as_ref()], ctx.program_id);
-        require_keys_eq!(expected_vault, vault_key, CrowdError::InvalidVault);
+        let vault_bump = ctx.bumps.vault;
         let seeds: &[&[u8]] = &[b"vault", campaign_key.as_ref(), &[vault_bump]];
 
         let ix = system_instruction::transfer(&vault_key, &contributor.key(), amount);
@@ -220,8 +226,11 @@ pub mod crowdfunding {
         )?;
 
         // Update state
-        campaign.raised = 0;
-        campaign.claimed = true;
+        campaign.raised = campaign
+            .raised
+            .checked_sub(amount)
+            .ok_or(CrowdError::MathOverflow)?;
+        contribution.amount = 0;
 
         msg!("Refunded: {} lamports", amount);
 
@@ -243,8 +252,12 @@ pub struct CreateCampaign<'info> {
     pub campaign: Account<'info, Campaign>,
 
     /// Vault PDA (holds SOL). Created manually in handler.
-    /// CHECK: PDA checked against seeds in handler.
-    #[account(mut)]
+    /// CHECK: PDA validated by seeds/bump.
+    #[account(
+        mut,
+        seeds = [b"vault", campaign.key().as_ref()],
+        bump
+    )]
     pub vault: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
@@ -266,6 +279,16 @@ pub struct Contribute<'info> {
     )]
     /// CHECK: PDA checked by seeds/bump.
     pub vault: UncheckedAccount<'info>,
+
+    /// Per-donor contribution record for this campaign
+    #[account(
+        init_if_needed,
+        payer = contributor,
+        seeds = [b"contribution", campaign.key().as_ref(), contributor.key().as_ref()],
+        bump,
+        space = 8 + Contribution::LEN
+    )]
+    pub contribution: Account<'info, Contribution>,
 
     pub system_program: Program<'info, System>,
 }
@@ -305,6 +328,14 @@ pub struct Refund<'info> {
     /// CHECK: PDA checked by seeds/bump.
     pub vault: UncheckedAccount<'info>,
 
+    #[account(
+        mut,
+        seeds = [b"contribution", campaign.key().as_ref(), contributor.key().as_ref()],
+        bump,
+        close = contributor
+    )]
+    pub contribution: Account<'info, Contribution>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -324,6 +355,20 @@ impl Campaign {
         8 +  // raised
         8 +  // deadline
         1;   // claimed
+}
+
+#[account]
+pub struct Contribution {
+    pub campaign: Pubkey,
+    pub contributor: Pubkey,
+    pub amount: u64,
+}
+
+impl Contribution {
+    pub const LEN: usize =
+        32 + // campaign
+        32 + // contributor
+        8;   // amount
 }
 
 #[error_code]
@@ -346,8 +391,10 @@ pub enum CrowdError {
     NothingToWithdraw,
     #[msg("Goal reached, refunds not allowed")]
     GoalReachedNoRefund,
+    #[msg("Invalid contribution account")]
+    InvalidContributionAccount,
     #[msg("Nothing to refund")]
     NothingToRefund,
-    #[msg("Invalid vault PDA provided")]
-    InvalidVault,
+    #[msg("Insufficient vault balance for refund")]
+    InsufficientVaultBalance,
 }
