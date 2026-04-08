@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     clock::Clock,
+    program::invoke,
     program::invoke_signed,
     rent::Rent,
     system_instruction,
@@ -91,14 +92,14 @@ pub mod crowdfunding {
             &vault.key(),
             amount,
         );
-        invoke_signed(
+        // No PDA signs this transfer (the contributor is the signer), so `invoke` is enough.
+        invoke(
             &ix,
             &[
                 contributor.to_account_info(),
                 vault.to_account_info(),
                 system_program.to_account_info(),
             ],
-            &[],
         )?;
 
         // Update campaign totals (checked math)
@@ -196,10 +197,9 @@ pub mod crowdfunding {
             return Err(CrowdError::GoalReachedNoRefund.into());
         }
 
-        // Refund only what this contributor donated to this campaign.
-        if contribution.campaign != campaign.key() || contribution.contributor != contributor.key() {
-            return Err(CrowdError::InvalidContributionAccount.into());
-        }
+        // NOTE: We intentionally do not re-check contribution.campaign/contributor here.
+        // The `seeds = ["contribution", campaign, contributor]` constraint in the Accounts
+        // struct already guarantees this relationship.
 
         let amount = contribution.amount;
         if amount == 0 {
@@ -234,6 +234,79 @@ pub mod crowdfunding {
 
         msg!("Refunded: {} lamports", amount);
 
+        Ok(())
+    }
+
+    /// Cleanup: close contributor's Contribution account after a successful campaign.
+    ///
+    /// Why: without this, contributors cannot reclaim the rent-exemption lamports
+    /// locked in their Contribution PDA after a campaign succeeds.
+    pub fn close_contribution(ctx: Context<CloseContribution>) -> Result<()> {
+        let clock = Clock::get()?;
+        let current_time = clock.unix_timestamp;
+
+        let campaign = &ctx.accounts.campaign;
+        if current_time < campaign.deadline {
+            return Err(CrowdError::TooEarly.into());
+        }
+        if campaign.raised < campaign.goal {
+            return Err(CrowdError::GoalNotReached.into());
+        }
+        if !campaign.claimed {
+            return Err(CrowdError::NotClaimedYet.into());
+        }
+
+        // The `close = contributor` constraint will refund rent to the contributor.
+        Ok(())
+    }
+
+    /// Cleanup: reclaim vault rent after a failed campaign.
+    ///
+    /// Why: the vault PDA is created rent-exempt, and after all refunds, its remaining
+    /// lamports are just rent. This instruction transfers the remaining lamports out
+    /// of the vault PDA so they are not stuck forever.
+    pub fn reclaim_vault_rent(ctx: Context<ReclaimVaultRent>) -> Result<()> {
+        let clock = Clock::get()?;
+        let current_time = clock.unix_timestamp;
+
+        let campaign = &mut ctx.accounts.campaign;
+        if current_time < campaign.deadline {
+            return Err(CrowdError::TooEarly.into());
+        }
+        if campaign.raised >= campaign.goal {
+            return Err(CrowdError::GoalReachedNoRefund.into());
+        }
+        if campaign.raised != 0 {
+            // Not all contributors have refunded yet.
+            return Err(CrowdError::PendingRefunds.into());
+        }
+
+        let vault = &mut ctx.accounts.vault;
+        let creator = &ctx.accounts.creator;
+        let system_program = &ctx.accounts.system_program;
+
+        let amount = vault.lamports();
+        if amount == 0 {
+            return Err(CrowdError::NothingToReclaim.into());
+        }
+
+        let vault_key = vault.key();
+        let campaign_key = campaign.key();
+        let vault_bump = ctx.bumps.vault;
+        let seeds: &[&[u8]] = &[b"vault", campaign_key.as_ref(), &[vault_bump]];
+
+        let ix = system_instruction::transfer(&vault_key, &creator.key(), amount);
+        invoke_signed(
+            &ix,
+            &[
+                vault.to_account_info(),
+                creator.to_account_info(),
+                system_program.to_account_info(),
+            ],
+            &[seeds],
+        )?;
+
+        msg!("Reclaimed vault rent: {} lamports", amount);
         Ok(())
     }
 }
@@ -339,6 +412,42 @@ pub struct Refund<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct CloseContribution<'info> {
+    #[account(mut)]
+    pub contributor: Signer<'info>,
+
+    #[account(mut)]
+    pub campaign: Account<'info, Campaign>,
+
+    #[account(
+        mut,
+        seeds = [b"contribution", campaign.key().as_ref(), contributor.key().as_ref()],
+        bump,
+        close = contributor
+    )]
+    pub contribution: Account<'info, Contribution>,
+}
+
+#[derive(Accounts)]
+pub struct ReclaimVaultRent<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    #[account(mut, has_one = creator)]
+    pub campaign: Account<'info, Campaign>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", campaign.key().as_ref()],
+        bump
+    )]
+    /// CHECK: PDA checked by seeds/bump.
+    pub vault: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 #[account]
 pub struct Campaign {
     pub creator: Pubkey, // Who created this
@@ -397,4 +506,10 @@ pub enum CrowdError {
     NothingToRefund,
     #[msg("Insufficient vault balance for refund")]
     InsufficientVaultBalance,
+    #[msg("Campaign has not been claimed yet")]
+    NotClaimedYet,
+    #[msg("There are still pending refunds")]
+    PendingRefunds,
+    #[msg("Nothing to reclaim from vault")]
+    NothingToReclaim,
 }
