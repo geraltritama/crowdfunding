@@ -3,12 +3,14 @@
   "scripts": {
     "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
     "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check",
-    "test:ts": "ts-mocha -p tsconfig.json \"tests/**/*.ts\""
+    "test:runtime": "bash -lc 'set -euo pipefail; RPC=http://127.0.0.1:8899; WALLET=/home/geraltritama33/.config/solana/id.json; solana-test-validator --reset --quiet >/tmp/solana-test-validator.log 2>&1 & pid=$!; trap \"kill $pid >/dev/null 2>&1 || true\" EXIT; for i in {1..40}; do solana cluster-version --url $RPC >/dev/null 2>&1 && break; sleep 1; done; solana cluster-version --url $RPC >/dev/null 2>&1; ANCHOR_PROVIDER_URL=$RPC anchor build >/dev/null; ANCHOR_PROVIDER_URL=$RPC anchor program deploy --provider.cluster localnet >/dev/null; ANCHOR_PROVIDER_URL=$RPC ANCHOR_WALLET=$WALLET yarn exec ts-mocha -p tsconfig.json \"tests/crowdfunding.ts\"'"
   },
   "dependencies": {
     "@anchor-lang/core": "^1.0.0"
   },
   "devDependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.98.4",
     "@types/bn.js": "^5.1.0",
     "@types/chai": "^4.3.0",
     "@types/mocha": "^9.0.0",

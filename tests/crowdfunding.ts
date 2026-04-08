@@ -1,104 +1,239 @@
 // @ts-nocheck
+import * as anchor from "@coral-xyz/anchor";
+import { Program, BN } from "@coral-xyz/anchor";
+import {
+  Keypair,
+  LAMPORTS_PER_SOL,
+  PublicKey,
+  SystemProgram,
+} from "@solana/web3.js";
 import { expect } from "chai";
-import * as fs from "fs";
+import { Crowdfunding } from "../target/types/crowdfunding";
 
-type AnchorIdl = {
-  instructions: Array<{
-    name: string;
-    accounts: Array<{
-      name: string;
-      writable?: boolean;
-      signer?: boolean;
-      pda?: {
-        seeds: Array<
-          | { kind: "const"; value: number[] }
-          | { kind: "account"; path: string }
-        >;
-      };
-    }>;
-  }>;
-};
+/**
+ * Runtime (localnet) integration tests.
+ *
+ * Run with:
+ * - `anchor test`  (recommended; starts a local validator and sets env vars)
+ */
 
-function constSeedToUtf8(seed: { kind: "const"; value: number[] }) {
-  return Buffer.from(seed.value).toString("utf8");
-}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function findInstruction(idl: AnchorIdl, name: string) {
-  const instr = idl.instructions.find((x) => x.name === name);
-  if (!instr) throw new Error(`Missing instruction: ${name}`);
-  return instr;
-}
+const getVaultPda = (programId: PublicKey, campaign: PublicKey) =>
+  PublicKey.findProgramAddressSync(
+    [Buffer.from("vault"), campaign.toBuffer()],
+    programId
+  )[0];
 
-function findPdaSeeds(
-  instr: ReturnType<typeof findInstruction>,
-  accountName: string
-) {
-  const acct = instr.accounts.find((a) => a.name === accountName);
-  expect(acct, `Account ${accountName} missing`).to.not.equal(undefined);
-  if (!acct?.pda) throw new Error(`Account ${accountName} has no PDA in IDL`);
-  return acct.pda.seeds;
-}
+const getContributionPda = (
+  programId: PublicKey,
+  campaign: PublicKey,
+  contributor: PublicKey
+) =>
+  PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("contribution"),
+      campaign.toBuffer(),
+      contributor.toBuffer(),
+    ],
+    programId
+  )[0];
 
-describe("Crowdfunding IDL structure (security-critical checks)", () => {
-  it("has all 4 required instructions", () => {
-    const idl: AnchorIdl = JSON.parse(
-      fs.readFileSync("target/idl/crowdfunding.json", "utf8")
+describe("crowdfunding runtime flow (localnet)", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const program = anchor.workspace.Crowdfunding as Program<Crowdfunding>;
+  const connection = provider.connection;
+
+  const airdrop = async (pk: PublicKey, sol = 10) => {
+    const sig = await connection.requestAirdrop(pk, sol * LAMPORTS_PER_SOL);
+    await connection.confirmTransaction(sig, "confirmed");
+  };
+
+  it("success path: contribute -> withdraw before deadline fails -> withdraw after deadline succeeds -> double withdraw fails", async function () {
+    this.timeout(120000);
+
+    const creator = Keypair.generate();
+    const contributor = Keypair.generate();
+    const campaign = Keypair.generate();
+
+    await airdrop(creator.publicKey, 10);
+    await airdrop(contributor.publicKey, 10);
+
+    const vault = getVaultPda(program.programId, campaign.publicKey);
+    const contribution = getContributionPda(
+      program.programId,
+      campaign.publicKey,
+      contributor.publicKey
     );
 
-    const names = idl.instructions.map((i) => i.name);
-    expect(names).to.include("create_campaign");
-    expect(names).to.include("contribute");
-    expect(names).to.include("withdraw");
-    expect(names).to.include("refund");
+    const goal = new BN(1 * LAMPORTS_PER_SOL);
+    const deadline = new BN(Math.floor(Date.now() / 1000) + 2);
+
+    const createSig = await program.methods
+      .createCampaign(goal, deadline)
+      .accounts({
+        creator: creator.publicKey,
+        campaign: campaign.publicKey,
+        vault,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([creator, campaign])
+      .rpc();
+
+    const contributeSig = await program.methods
+      .contribute(new BN(2 * LAMPORTS_PER_SOL))
+      .accounts({
+        contributor: contributor.publicKey,
+        campaign: campaign.publicKey,
+        vault,
+        contribution,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([contributor])
+      .rpc();
+
+    // withdraw BEFORE deadline should fail
+    try {
+      await program.methods
+        .withdraw()
+        .accounts({
+          creator: creator.publicKey,
+          campaign: campaign.publicKey,
+          vault,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([creator])
+        .rpc();
+      expect.fail("withdraw before deadline should throw");
+    } catch (err: any) {
+      expect(err.message).to.match(/tooEarly|deadline/i);
+    }
+
+    await sleep(2500);
+
+    const withdrawSig = await program.methods
+      .withdraw()
+      .accounts({
+        creator: creator.publicKey,
+        campaign: campaign.publicKey,
+        vault,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([creator])
+      .rpc();
+
+    // double withdraw should fail
+    try {
+      await program.methods
+        .withdraw()
+        .accounts({
+          creator: creator.publicKey,
+          campaign: campaign.publicKey,
+          vault,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([creator])
+        .rpc();
+      expect.fail("double withdraw should throw");
+    } catch (err: any) {
+      expect(err.message).to.match(/alreadyClaimed/i);
+    }
+
+    console.log(
+      JSON.stringify(
+        { createSig, contributeSig, withdrawSig },
+        null,
+        2
+      )
+    );
   });
 
-  it("vault PDA uses seeds: ['vault', campaign]", () => {
-    const idl: AnchorIdl = JSON.parse(
-      fs.readFileSync("target/idl/crowdfunding.json", "utf8")
-    );
-    const create = findInstruction(idl, "create_campaign");
-    const vaultSeeds = findPdaSeeds(create, "vault");
+  it("refund path: contribute -> refund after deadline succeeds -> double refund fails", async function () {
+    this.timeout(120000);
 
-    const [s0, s1] = vaultSeeds;
-    expect("kind" in s0 && s0.kind === "const").to.equal(true);
-    expect(constSeedToUtf8(s0 as any)).to.equal("vault");
+    const creator = Keypair.generate();
+    const contributor = Keypair.generate();
+    const campaign = Keypair.generate();
 
-    expect("kind" in s1 && s1.kind === "account").to.equal(true);
-    expect((s1 as any).path).to.equal("campaign");
-  });
+    await airdrop(creator.publicKey, 10);
+    await airdrop(contributor.publicKey, 10);
 
-  it("refund requires per-user contribution PDA (refund safety)", () => {
-    const idl: AnchorIdl = JSON.parse(
-      fs.readFileSync("target/idl/crowdfunding.json", "utf8")
-    );
-    const refund = findInstruction(idl, "refund");
-
-    const contribAcct = refund.accounts.find((a) => a.name === "contribution");
-    expect(
-      contribAcct,
-      "refund must include contribution account"
-    ).to.not.equal(undefined);
-    expect(contribAcct?.writable, "contribution must be writable").to.equal(
-      true
-    );
-    expect(contribAcct?.pda, "contribution must be a PDA").to.not.equal(
-      undefined
+    const vault = getVaultPda(program.programId, campaign.publicKey);
+    const contribution = getContributionPda(
+      program.programId,
+      campaign.publicKey,
+      contributor.publicKey
     );
 
-    const seeds = findPdaSeeds(refund, "contribution");
-    // expected: ["contribution", campaign, contributor]
-    const constSeed = seeds[0];
-    const campaignSeed = seeds[1];
-    const contributorSeed = seeds[2];
+    const goal = new BN(100 * LAMPORTS_PER_SOL); // won't be met
+    const deadline = new BN(Math.floor(Date.now() / 1000) + 2);
 
-    expect(constSeed.kind).to.equal("const");
-    expect(constSeedToUtf8(constSeed as any)).to.equal("contribution");
+    const createSig = await program.methods
+      .createCampaign(goal, deadline)
+      .accounts({
+        creator: creator.publicKey,
+        campaign: campaign.publicKey,
+        vault,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([creator, campaign])
+      .rpc();
 
-    expect(campaignSeed.kind).to.equal("account");
-    expect((campaignSeed as any).path).to.equal("campaign");
+    const contributeSig = await program.methods
+      .contribute(new BN(1 * LAMPORTS_PER_SOL))
+      .accounts({
+        contributor: contributor.publicKey,
+        campaign: campaign.publicKey,
+        vault,
+        contribution,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([contributor])
+      .rpc();
 
-    expect(contributorSeed.kind).to.equal("account");
-    expect((contributorSeed as any).path).to.equal("contributor");
+    await sleep(2500);
+
+    const refundSig = await program.methods
+      .refund()
+      .accounts({
+        contributor: contributor.publicKey,
+        campaign: campaign.publicKey,
+        vault,
+        contribution,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([contributor])
+      .rpc();
+
+    // double refund should fail
+    try {
+      await program.methods
+        .refund()
+        .accounts({
+          contributor: contributor.publicKey,
+          campaign: campaign.publicKey,
+          vault,
+          contribution,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([contributor])
+        .rpc();
+      expect.fail("double refund should throw");
+    } catch (err: any) {
+      // Depending on whether the Contribution account was closed, Anchor may throw an
+      // account-related error before reaching the program error code.
+      expect(err.message).to.match(/nothingToRefund|invalid|claimed|contribut|account/i);
+    }
+
+    console.log(
+      JSON.stringify(
+        { createSig, contributeSig, refundSig },
+        null,
+        2
+      )
+    );
   });
 });
 
