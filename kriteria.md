@@ -1,4 +1,3 @@
-# 📦 Dokumentasi Superteam Indonesia — Weekend Class
 ### Platform Crowdfunding Solana + Kriteria Code Review
 
 ---
